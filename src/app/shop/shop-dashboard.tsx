@@ -511,7 +511,12 @@ function OrderCard({
               Back
             </Button>
             <span className="text-xs text-muted">
-              {o.payment_status === "paid" ? "The online payment will be refunded automatically. " : ""}The student is notified.
+              {o.payment_status === "paid"
+                ? cancelCode === "not_collected"
+                  ? "The prints were made, so the payment is kept. "
+                  : "The online payment will be refunded automatically. "
+                : ""}
+              The student is notified.
             </span>
           </div>
         </div>

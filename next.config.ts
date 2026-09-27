@@ -2,6 +2,8 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
+  // pdf.js loads its parser module at runtime; keep it out of the server bundle.
+  serverExternalPackages: ["pdfjs-dist"],
   async headers() {
     return [
       {

@@ -496,7 +496,9 @@ begin
       new.id,
       case when tg_op = 'UPDATE' then old.status end,
       new.status,
-      coalesce(nullif(current_setting('app.actor_id', true), '')::uuid, auth.uid()),
+      -- 'system' marks automatic changes (timeouts, payments) made inside a user's request.
+      case when current_setting('app.actor_id', true) = 'system' then null
+           else coalesce(nullif(current_setting('app.actor_id', true), '')::uuid, auth.uid()) end,
       case when new.status = 'cancelled' then coalesce(new.cancel_reason, new.cancel_code::text) end
     );
   end if;
@@ -509,6 +511,7 @@ create trigger orders_log_status
   for each row execute function public.log_order_status();
 
 -- Orders a student left uncollected (shown to staff, limits pay-at-collection).
+-- Only the student themselves and staff get a number; anyone else gets null.
 create or replace function public.no_show_count(p_profile public.profiles)
 returns int
 language sql
@@ -516,8 +519,12 @@ stable
 security definer
 set search_path = ''
 as $$
-  select count(*)::int from public.orders
-  where student_id = p_profile.id and cancel_code = 'not_collected';
+  select case
+    when p_profile.id = auth.uid() or public.is_staff() or auth.uid() is null then (
+      select count(*)::int from public.orders
+      where student_id = p_profile.id and cancel_code = 'not_collected'
+    )
+  end;
 $$;
 
 create or replace function public.next_order_token()
@@ -556,7 +563,7 @@ as $$
 declare
   v_count int;
 begin
-  perform set_config('app.actor_id', '', true);
+  perform set_config('app.actor_id', 'system', true);
   update public.orders o
      set status = 'cancelled',
          cancel_code = 'payment_timeout',
@@ -568,6 +575,7 @@ begin
      and o.created_at < now() - make_interval(mins => s.payment_window_minutes)
      and (p_student_id is null or o.student_id = p_student_id);
   get diagnostics v_count = row_count;
+  perform set_config('app.actor_id', '', true);
   return v_count;
 end;
 $$;
@@ -995,13 +1003,18 @@ begin
       if v_code = 'not_collected' and v_from <> 'ready' then
         raise exception using errcode = 'P0001', message = 'INVALID_CANCEL_CODE';
       end if;
+      -- Paid orders are refunded, except when the prints were made and never
+      -- collected: then the shop keeps the payment.
       update public.orders
          set status = 'cancelled',
              cancel_code = v_code,
              cancel_reason = v_reason,
              cancelled_at = now(),
              cancelled_by = v_uid,
-             payment_status = case when payment_status = 'paid' then 'refund_pending'::public.payment_status else payment_status end
+             payment_status = case
+               when payment_status = 'paid' and v_code <> 'not_collected' then 'refund_pending'::public.payment_status
+               else payment_status
+             end
        where id = p_order_id returning * into v_order;
 
     else
@@ -1044,10 +1057,20 @@ begin
       detail = coalesce(p_amount_paise::text, 'null') || ' <> ' || v_order.amount_paise::text;
   end if;
 
-  perform set_config('app.actor_id', '', true);
+  perform set_config('app.actor_id', 'system', true);
 
   if v_order.status = 'awaiting_payment'
-     or (v_order.status = 'cancelled' and v_order.cancel_code = 'payment_timeout') then
+     or (
+       -- A late payment revives a timed-out order only while it can still be
+       -- printed: within a day, and with every file still stored.
+       v_order.status = 'cancelled' and v_order.cancel_code = 'payment_timeout'
+       and v_order.created_at > now() - interval '24 hours'
+       and not exists (
+         select 1 from public.order_items oi
+         join public.files f on f.id = oi.file_id
+         where oi.order_id = v_order.id and f.status <> 'ready'
+       )
+     ) then
     -- Late payments bring a timed-out order back; it needs a fresh token if
     -- its old one has been handed to someone else meanwhile.
     update public.orders
@@ -1071,7 +1094,8 @@ begin
      where id = v_order.id
      returning * into v_order;
   elsif v_order.status = 'cancelled' then
-    -- Paid after the student cancelled: keep it cancelled and refund.
+    -- Paid after the student cancelled, or too late to revive: keep it
+    -- cancelled and refund.
     update public.orders
        set payment_status = 'refund_pending',
            razorpay_payment_id = p_razorpay_payment_id,
@@ -1187,7 +1211,7 @@ create index push_subscriptions_user_idx on public.push_subscriptions (user_id);
 -- Files whose objects should be removed from R2:
 --   * uploads never attached to an order, after 24 hours
 --   * files on orders older than the retention period, once no open order
---     still needs them for printing
+--     (queued, printing or waiting for collection) still needs them
 create or replace function public.files_due_for_deletion(p_limit int default 500)
 returns table (id uuid, object_key text)
 language sql
@@ -1213,7 +1237,7 @@ as $$
           join public.orders o on o.id = oi.order_id
           where oi.file_id = f.id
             and (
-              o.status in ('awaiting_payment', 'placed', 'taken')
+              o.status in ('awaiting_payment', 'placed', 'taken', 'ready')
               or o.created_at > now() - make_interval(days => s.file_retention_days)
             )
         )

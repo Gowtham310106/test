@@ -1,20 +1,24 @@
 import { NextResponse } from "next/server";
 import { razorpayConfig } from "@/lib/env";
-import { settlePayment } from "@/lib/orders-server";
-import { verifyWebhookSignature, type RazorpayPayment } from "@/lib/razorpay";
+import { settlePaymentById } from "@/lib/orders-server";
+import { verifyWebhookSignature } from "@/lib/razorpay";
 import { createAdminClient } from "@/lib/supabase/admin";
 
 interface WebhookEvent {
   event: string;
   payload?: {
-    payment?: { entity?: RazorpayPayment };
+    payment?: { entity?: { id: string; order_id: string | null } };
     refund?: { entity?: { id: string; payment_id: string; status: string } };
   };
 }
 
 /**
  * Razorpay webhook (events: payment.authorized, payment.captured, order.paid,
- * refund.processed). Point the Razorpay dashboard at /api/payments/webhook.
+ * refund.processed, refund.failed). Point the Razorpay dashboard at
+ * /api/payments/webhook.
+ *
+ * Answers 500 when processing fails so Razorpay retries; an event is recorded
+ * as processed only after it succeeded.
  */
 export async function POST(request: Request) {
   const cfg = razorpayConfig();
@@ -34,29 +38,23 @@ export async function POST(request: Request) {
   }
 
   const admin = createAdminClient();
-  const payment = event.payload?.payment?.entity;
   const eventId = request.headers.get("x-razorpay-event-id");
-
-  // Razorpay retries deliveries; process each event id once.
   if (eventId) {
-    const { error } = await admin.from("payment_events").insert({
-      id: eventId,
-      event_type: event.event,
-      razorpay_order_id: payment?.order_id ?? null,
-      payload: event,
-    });
-    if (error?.code === "23505") return NextResponse.json({ ok: true, duplicate: true });
+    const { data: seen } = await admin.from("payment_events").select("id").eq("id", eventId).maybeSingle();
+    if (seen) return NextResponse.json({ ok: true, duplicate: true });
   }
 
+  const payment = event.payload?.payment?.entity;
+  const refund = event.payload?.refund?.entity;
   try {
     switch (event.event) {
       case "payment.authorized":
       case "payment.captured":
       case "order.paid":
-        if (payment) await settlePayment(payment);
+        // Re-fetched inside: the payload may already be out of date.
+        if (payment?.id) await settlePaymentById(payment.id);
         break;
-      case "refund.processed": {
-        const refund = event.payload?.refund?.entity;
+      case "refund.processed":
         if (refund) {
           await admin
             .from("orders")
@@ -64,14 +62,29 @@ export async function POST(request: Request) {
             .eq("razorpay_payment_id", refund.payment_id);
         }
         break;
-      }
+      case "refund.failed":
+        if (refund) {
+          // Back to the Refunds tab, where staff can retry.
+          await admin
+            .from("orders")
+            .update({ payment_status: "refund_pending", refund_id: null, refund_error: "Razorpay reported the refund failed." })
+            .eq("razorpay_payment_id", refund.payment_id)
+            .eq("refund_id", refund.id);
+        }
+        break;
     }
   } catch (e) {
     console.error(`webhook ${event.event} failed`, e);
-    // Let Razorpay retry: forget the event so the retry is processed.
-    if (eventId) await admin.from("payment_events").delete().eq("id", eventId);
     return NextResponse.json({ error: "Processing failed" }, { status: 500 });
   }
 
+  if (eventId) {
+    await admin
+      .from("payment_events")
+      .upsert(
+        { id: eventId, event_type: event.event, razorpay_order_id: payment?.order_id ?? null, payload: event },
+        { onConflict: "id", ignoreDuplicates: true },
+      );
+  }
   return NextResponse.json({ ok: true });
 }

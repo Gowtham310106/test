@@ -30,33 +30,81 @@ export async function countPages(bytes: Uint8Array, kind: FileKind): Promise<Pag
   }
 }
 
-async function countPdfPages(bytes: Uint8Array): Promise<PageCountResult> {
+type PdfjsResult = { pages: number } | { password: true } | { failed: true };
+
+/**
+ * Page count as a PDF viewer sees it: pdf.js follows the cross-reference
+ * table like Chrome, Edge and Acrobat do.
+ */
+async function pdfjsPageCount(bytes: Uint8Array): Promise<PdfjsResult> {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  // Registers the parser on globalThis so it runs in this process, no worker thread.
+  await import("pdfjs-dist/legacy/build/pdf.worker.mjs");
+  const task = pdfjs.getDocument({
+    // pdf.js takes ownership of the buffer it is given; keep ours intact.
+    data: bytes.slice(),
+    disableFontFace: true,
+    useSystemFonts: false,
+    stopAtErrors: false,
+    verbosity: 0,
+  });
   try {
-    const doc = await PDFDocument.load(bytes, {
-      ignoreEncryption: true,
-      updateMetadata: false,
-      throwOnInvalidObject: false,
-    });
-    const pages = doc.getPageCount();
-    const encrypted = doc.isEncrypted;
-    const warning = encrypted
-      ? "This PDF is protected. If it asks for a password when opened, the shop can't print it — remove the password and upload again."
-      : undefined;
-    if (pages > 0) return { detection: "exact", pages, encrypted, warning };
+    const doc = await task.promise;
+    return { pages: doc.numPages };
+  } catch (e) {
+    return (e as { name?: string }).name === "PasswordException" ? { password: true } : { failed: true };
+  } finally {
+    await task.destroy();
+  }
+}
+
+/** Second opinion from a different parser; returns null if it can't read the file. */
+async function pdfLibPageCount(bytes: Uint8Array): Promise<{ pages: number; encrypted: boolean } | null> {
+  try {
+    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false, throwOnInvalidObject: false });
+    return { pages: doc.getPageCount(), encrypted: doc.isEncrypted };
+  } catch {
+    return null;
+  }
+}
+
+// Two independent parsers must agree before a count is trusted as exact. A
+// crafted PDF can show one parser fewer pages than a viewer prints; when they
+// disagree the student enters the count and the shop is told to check it.
+async function countPdfPages(bytes: Uint8Array): Promise<PageCountResult> {
+  const [viewer, second] = await Promise.all([pdfjsPageCount(bytes), pdfLibPageCount(bytes)]);
+  const encrypted = second?.encrypted ?? false;
+
+  if ("password" in viewer) {
+    return {
+      detection: "none",
+      pages: null,
+      encrypted: true,
+      rejectReason: "This PDF needs a password to open, so the shop can't print it. Remove the password and upload it again.",
+    };
+  }
+  if ("failed" in viewer || viewer.pages < 1) {
     return {
       detection: "none",
       pages: null,
       encrypted,
-      warning: "We couldn't count the pages in this PDF. Enter the number of pages.",
-    };
-  } catch {
-    return {
-      detection: "none",
-      pages: null,
-      encrypted: false,
       warning: "We couldn't read this PDF. Check that it opens on your phone, then enter the number of pages.",
     };
   }
+  if (second && second.pages !== viewer.pages) {
+    return {
+      detection: "none",
+      pages: null,
+      encrypted,
+      warning: "We couldn't count the pages in this PDF reliably. Enter the number of pages — the shop will check it.",
+    };
+  }
+  return {
+    detection: "exact",
+    pages: viewer.pages,
+    encrypted,
+    warning: encrypted ? "This PDF has copy/print restrictions. The shop will check it opens before printing." : undefined,
+  };
 }
 
 const PAGES_TAG = /<(?:\w+:)?Pages>\s*(\d+)\s*<\/(?:\w+:)?Pages>/;

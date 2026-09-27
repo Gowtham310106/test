@@ -1,14 +1,17 @@
 import { NextResponse } from "next/server";
 import { cronSecret } from "@/lib/env";
+import { processRefund } from "@/lib/orders-server";
 import { deleteObjects } from "@/lib/r2";
 import { createAdminClient } from "@/lib/supabase/admin";
+import type { Order } from "@/lib/types";
 
 export const maxDuration = 60;
 
 /**
  * Scheduled housekeeping (see vercel.json / README):
  *   1. cancel online orders whose payment window ran out
- *   2. delete files past the retention period from R2
+ *   2. retry refunds that are still pending
+ *   3. delete files past the retention period from R2
  * Protected by CRON_SECRET, sent as "Authorization: Bearer <secret>".
  */
 async function handle(request: Request) {
@@ -20,6 +23,17 @@ async function handle(request: Request) {
   const admin = createAdminClient();
   const { data: expired, error: expireError } = await admin.rpc("expire_stale_payments", { p_student_id: null });
   if (expireError) console.error("expire_stale_payments failed", expireError);
+
+  let refunded = 0;
+  const { data: pendingRefunds } = await admin
+    .from("orders")
+    .select("*")
+    .eq("payment_status", "refund_pending")
+    .not("razorpay_payment_id", "is", null)
+    .limit(20);
+  for (const order of (pendingRefunds ?? []) as Order[]) {
+    if ((await processRefund(order)).payment_status === "refunded") refunded += 1;
+  }
 
   let deleted = 0;
   let failed = 0;
@@ -43,7 +57,7 @@ async function handle(request: Request) {
     if (done.length === 0) break;
   }
 
-  return NextResponse.json({ expiredOrders: expired ?? 0, deletedFiles: deleted, failedFiles: failed });
+  return NextResponse.json({ expiredOrders: expired ?? 0, refunded, deletedFiles: deleted, failedFiles: failed });
 }
 
 export const GET = handle;

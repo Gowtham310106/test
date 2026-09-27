@@ -9,6 +9,32 @@ async function pdfWithPages(n: number) {
   return doc.save();
 }
 
+/**
+ * A PDF with the page tree defined twice: the cross-reference table (what
+ * viewers follow) points at the 3-page version, a later duplicate claims 1.
+ */
+function duplicatePageTreePdf() {
+  const objs: [number, string][] = [
+    [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+    [2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"],
+    [3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>"],
+    [4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>"],
+    [5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>"],
+    [2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"],
+  ];
+  let out = "%PDF-1.4\n";
+  const offsets = new Map<number, number>();
+  for (const [n, body] of objs) {
+    if (!offsets.has(n)) offsets.set(n, out.length);
+    out += `${n} 0 obj\n${body}\nendobj\n`;
+  }
+  const xref = out.length;
+  out += "xref\n0 6\n0000000000 65535 f \n";
+  for (let n = 1; n <= 5; n++) out += `${String(offsets.get(n)).padStart(10, "0")} 00000 n \n`;
+  out += `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return new TextEncoder().encode(out);
+}
+
 function docx(appXml: string | null) {
   const files: Record<string, Uint8Array> = {
     "[Content_Types].xml": strToU8("<Types/>"),
@@ -30,6 +56,26 @@ describe("countPages", () => {
     expect(result.pages).toBeNull();
     expect(result.warning).toBeTruthy();
     expect(result.rejectReason).toBeUndefined();
+  });
+
+  it("does not trust a count the parsers disagree on", async () => {
+    const result = await countPages(duplicatePageTreePdf(), "pdf");
+    expect(result.detection).toBe("none");
+    expect(result.pages).toBeNull();
+  });
+
+  it("rejects PDFs that need a password to open", async () => {
+    const doc = await PDFDocument.create();
+    doc.addPage();
+    const bytes = await doc.save({ useObjectStreams: false });
+    // Mark it encrypted with a user password pdf.js can't open without.
+    const text = new TextDecoder("latin1").decode(bytes);
+    const withEncrypt = text.replace(
+      /trailer\s*<</,
+      "trailer\n<< /Encrypt << /Filter /Standard /V 1 /R 2 /O <00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff> /U <00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff> /P -4 >> /ID [<00112233445566778899aabbccddeeff> <00112233445566778899aabbccddeeff>]",
+    );
+    const result = await countPages(Uint8Array.from(withEncrypt, (c) => c.charCodeAt(0)), "pdf");
+    expect(result.rejectReason).toMatch(/password/);
   });
 
   it("reads the page count Word saved, as an estimate", async () => {

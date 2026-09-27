@@ -67,6 +67,11 @@ export async function headObject(key: string): Promise<{ size: number; contentTy
   }
 }
 
+/** Server-side write, used to store the exact bytes that were verified. */
+export async function putObject(key: string, body: Uint8Array, contentType: string) {
+  await s3().send(new PutObjectCommand({ Bucket: r2Config().bucket, Key: key, Body: body, ContentType: contentType }));
+}
+
 export async function getObjectBytes(key: string): Promise<Uint8Array> {
   const res = await s3().send(new GetObjectCommand({ Bucket: r2Config().bucket, Key: key }));
   if (!res.Body) throw new Error(`Empty body for ${key}`);

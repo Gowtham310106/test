@@ -47,7 +47,8 @@ export async function POST(request: Request) {
     return jsonError("Too many uploads in the last hour. Please wait a little and try again.", 429);
   }
 
-  const objectKey = `uploads/${auth.userId}/${crypto.randomUUID()}.${type.ext}`;
+  // Browser uploads land under incoming/; only the server writes the verified copy under files/.
+  const objectKey = `incoming/${auth.userId}/${crypto.randomUUID()}.${type.ext}`;
   const { data: file, error } = await admin
     .from("files")
     .insert({

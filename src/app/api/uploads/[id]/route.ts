@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { jsonError, requireUser } from "@/lib/api";
 import { imageMime, signatureMatches, sniffSignature } from "@/lib/files";
 import { countPages } from "@/lib/page-count";
-import { deleteObjects, getObjectBytes, headObject } from "@/lib/r2";
+import { deleteObjects, getObjectBytes, headObject, putObject } from "@/lib/r2";
 import { createAdminClient } from "@/lib/supabase/admin";
 import type { FileRow } from "@/lib/types";
 
@@ -26,7 +26,9 @@ function summary(file: FileRow, warning?: string) {
 /**
  * Step 2 of an upload: the browser finished the PUT. Check the object really
  * is what it claims to be and count its pages on the server, so page counts
- * (and so prices) never come from the browser.
+ * (and so prices) never come from the browser. The verified bytes are then
+ * stored under a new key: the upload URL stays valid for a few minutes, and a
+ * second PUT to it must not swap in a longer file after counting.
  */
 export async function POST(_request: Request, ctx: RouteContext<"/api/uploads/[id]">) {
   const { id } = await ctx.params;
@@ -59,6 +61,7 @@ export async function POST(_request: Request, ctx: RouteContext<"/api/uploads/[i
   if (head.size !== file.size_bytes) return reject("The upload was incomplete. Please upload the file again.");
 
   const bytes = await getObjectBytes(file.object_key);
+  if (bytes.length !== file.size_bytes) return reject("The upload was incomplete. Please upload the file again.");
   const signature = sniffSignature(bytes);
   if (!signatureMatches(file.kind, signature)) {
     return reject(`This file isn't a real ${file.kind === "image" ? "photo" : file.kind.toUpperCase()} file. Save it again and re-upload.`);
@@ -67,14 +70,21 @@ export async function POST(_request: Request, ctx: RouteContext<"/api/uploads/[i
   const result = await countPages(bytes, file.kind);
   if (result.rejectReason) return reject(result.rejectReason);
 
+  const mimeType = file.kind === "image" ? imageMime(signature) : file.mime_type;
+  // A fresh key per attempt, so a concurrent duplicate request can't clobber this one.
+  const ext = file.object_key.split(".").pop();
+  const verifiedKey = `files/${auth.userId}/${crypto.randomUUID()}.${ext}`;
+  await putObject(verifiedKey, bytes, mimeType);
+
   const { data: updated, error } = await admin
     .from("files")
     .update({
+      object_key: verifiedKey,
       status: "ready",
       page_detection: result.detection,
       detected_pages: result.pages,
       is_encrypted: result.encrypted,
-      mime_type: file.kind === "image" ? imageMime(signature) : file.mime_type,
+      mime_type: mimeType,
       uploaded_at: new Date().toISOString(),
       error: null,
     })
@@ -82,7 +92,11 @@ export async function POST(_request: Request, ctx: RouteContext<"/api/uploads/[i
     .eq("status", "pending")
     .select("*")
     .single<FileRow>();
-  if (error || !updated) return jsonError("Couldn't finish the upload. Please try again.", 500);
+  if (error || !updated) {
+    await deleteObjects([verifiedKey]).catch(() => undefined);
+    return jsonError("Couldn't finish the upload. Please try again.", 500);
+  }
+  await deleteObjects([file.object_key]).catch(() => undefined);
 
   return NextResponse.json(summary(updated, result.warning));
 }

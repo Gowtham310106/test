@@ -544,6 +544,48 @@ describe("online payments", () => {
     expect(revived).toMatchObject({ status: "placed", payment_status: "paid", cancel_code: null });
   });
 
+  it("logs timeouts as automatic, not as the student", async () => {
+    const o = await onlineOrder("order_9");
+    await asSuperuser(db);
+    await db.query("update public.orders set created_at = now() - interval '40 minutes' where id = $1", [o.id]);
+    // The expiry runs inside the student's next order.
+    const file = await createFile(db, student, { pages: 1 });
+    await placeOrder(db, student, "cash", [{ file_id: file, color_mode: "bw", copies: 1 }]);
+    const ev = await one(db, "select actor_id from public.order_events where order_id = $1 and to_status = 'cancelled'", [o.id]);
+    expect(ev.actor_id).toBeNull();
+  });
+
+  it("refunds instead of reviving when the files are gone or the payment is a day late", async () => {
+    const gone = await onlineOrder("order_10");
+    await asSuperuser(db);
+    await db.query("update public.orders set status = 'cancelled', cancel_code = 'payment_timeout' where id = $1", [gone.id]);
+    await db.query("update public.files set status = 'deleted' where id in (select file_id from public.order_items where order_id = $1)", [gone.id]);
+    expect(await markPaid("order_10", "pay_10", gone.amount_paise as number)).toMatchObject({
+      status: "cancelled",
+      payment_status: "refund_pending",
+    });
+
+    const late = await onlineOrder("order_11");
+    await asSuperuser(db);
+    await db.query(
+      "update public.orders set status = 'cancelled', cancel_code = 'payment_timeout', created_at = now() - interval '2 days' where id = $1",
+      [late.id],
+    );
+    expect(await markPaid("order_11", "pay_11", late.amount_paise as number)).toMatchObject({
+      status: "cancelled",
+      payment_status: "refund_pending",
+    });
+  });
+
+  it("keeps the payment when a paid order is printed but never collected", async () => {
+    const o = await onlineOrder("order_12");
+    await markPaid("order_12", "pay_12", o.amount_paise as number);
+    await staffTransition(db, staff, o.id as string, "taken", "placed");
+    await staffTransition(db, staff, o.id as string, "ready", "taken");
+    const c = await staffTransition(db, staff, o.id as string, "cancelled", "ready", { code: "not_collected" });
+    expect(c).toMatchObject({ status: "cancelled", payment_status: "paid" });
+  });
+
   it("gives a revived order a new token if its old one was reissued", async () => {
     const o = await onlineOrder("order_5");
     await asSuperuser(db);
@@ -641,6 +683,18 @@ describe("privacy and row level security", () => {
     expect(await errorOf(db.query("select * from public.payment_events"))).toMatch(/permission denied/);
   });
 
+  it("keeps no-show counts between the student and the shop", async () => {
+    await asUser(db, bob);
+    const other = await one(db, "select public.no_show_count(p) as n from public.profiles p where p.id = $1", [bob]);
+    expect(other.n).toBe(0);
+    // Forging a row with someone else's id gets nothing back.
+    const forged = await one(db, "select public.no_show_count(row($1::uuid, 'x', 'student', null, null, null, null, null, now(), now())::public.profiles) as n", [alice]);
+    expect(forged.n).toBeNull();
+    await asUser(db, staff);
+    const seen = await one(db, "select public.no_show_count(p) as n from public.profiles p where p.id = $1", [alice]);
+    expect(seen.n).toBe(0);
+  });
+
   it("only admins change settings", async () => {
     await asUser(db, staff);
     const res = await db.query("update public.app_settings set max_copies = 3 where id = 1 returning id");
@@ -704,16 +758,20 @@ describe("file retention", () => {
     const oldDone = await createFile(db, student, { pages: 1 });
     const oldQueued = await createFile(db, student, { pages: 1 });
     const recentDone = await createFile(db, student, { pages: 1 });
+    const oldReady = await createFile(db, student, { pages: 1 });
 
     const done = await placeOrder(db, student, "cash", [{ file_id: oldDone, color_mode: "bw", copies: 1 }]);
     const queued = await placeOrder(db, student, "cash", [{ file_id: oldQueued, color_mode: "bw", copies: 1 }]);
     const recent = await placeOrder(db, student, "cash", [{ file_id: recentDone, color_mode: "bw", copies: 1 }]);
+    const ready = await placeOrder(db, student, "cash", [{ file_id: oldReady, color_mode: "bw", copies: 1 }]);
 
     await asSuperuser(db);
     await db.query("update public.files set created_at = now() - interval '2 days' where id = any($1)", [
-      [abandoned, oldDone, oldQueued, recentDone],
+      [abandoned, oldDone, oldQueued, recentDone, oldReady],
     ]);
-    await db.query("update public.orders set created_at = now() - interval '8 days' where id = any($1)", [[done.id, queued.id]]);
+    await db.query("update public.orders set created_at = now() - interval '8 days' where id = any($1)", [[done.id, queued.id, ready.id]]);
+    // Printed and waiting for collection: kept so staff can still reprint.
+    await db.query("update public.orders set status = 'ready' where id = $1", [ready.id]);
     await db.query("update public.orders set status = 'cancelled', cancel_code = 'shop' where id = any($1)", [[done.id, recent.id]]);
 
     await asService(db);
@@ -722,6 +780,7 @@ describe("file retention", () => {
     expect(due).not.toContain(fresh);
     expect(due).not.toContain(oldQueued);
     expect(due).not.toContain(recentDone);
+    expect(due).not.toContain(oldReady);
 
     expect((await one(db, "select public.mark_files_deleted($1) as n", [due])).n).toBe(2);
     expect((await db.query("select id from public.files_due_for_deletion(100)")).rows).toHaveLength(0);

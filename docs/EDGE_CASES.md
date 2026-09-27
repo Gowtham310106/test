@@ -29,10 +29,13 @@ hold even if someone calls the API directly; the tests in `supabase/tests/db.tes
 | A file renamed to `.pdf` that isn't a PDF | Server reads the uploaded object's real signature and rejects it; object deleted from R2 | `api/uploads/[id]` |
 | A PNG saved with `.jpg` | Accepted — both are images — and stored with the right type | `signatureMatches()` |
 | Student lies about the page count to pay less | Page counts come from the server reading the file. For PDFs and photos the student's number is ignored | `page-count.ts`, `place_order()` |
+| Student re-uploads a longer file to the same upload link after it was counted | The server stores the exact bytes it counted under a new key no upload link can write to; the shop downloads that copy | `api/uploads/[id]` |
+| Crafted PDF that shows one parser fewer pages than a viewer prints | Pages are counted by pdf.js (follows the cross-reference table like Chrome/Acrobat) and by pdf-lib; if they disagree the count isn't trusted — the student enters it and the shop is told to check | `countPdfPages()` |
 | Word file (.docx) | Page count read from the document's metadata and shown as an estimate the student can correct; the shop sees "page count from Word — check" | `countDocxPages()` |
 | Old Word (.doc), damaged PDF, PDF whose pages can't be counted | Student enters the number of pages; the shop sees "page count entered by student — check" | `page-count.ts`, dashboard badge |
 | A `.docx` that is really a spreadsheet or random zip | Rejected: not a Word document | `countDocxPages()` |
-| Password-protected PDF | Accepted with a warning to remove the password; the shop sees a "Protected PDF" badge and can cancel with reason "Problem with the file" | `countPdfPages()`, dashboard |
+| PDF that needs a password to open | Rejected with a message to remove the password — the shop couldn't open it either | `countPdfPages()` |
+| PDF with only copy/print restrictions (opens without a password) | Accepted; the shop sees a "Protected PDF" badge and can cancel with reason "Problem with the file" if it won't print | `countPdfPages()`, dashboard |
 | File bigger than the limit (25 MB default) | Refused before upload; the signed upload URL also fixes the size, and the server re-checks it | `api/uploads`, `r2.ts` |
 | Upload cut off halfway (weak Wi-Fi in the hostel) | Size mismatch detected, file rejected; the student taps Retry | `api/uploads/[id]` |
 | Student leaves the page while uploading | Browser asks for confirmation | `new-order-form.tsx` |
@@ -70,7 +73,9 @@ hold even if someone calls the API directly; the tests in `supabase/tests/db.tes
 | Student closes Razorpay without paying | Order stays "awaiting payment" (not in the shop's queue) with a *Pay now* button and a countdown | `order-actions.tsx` |
 | Never paid | Cancelled after 30 minutes (configurable) | `expire_stale_payments()` |
 | Paid at minute 31, after it was expired | The late payment brings the order back into the queue; if its token was reissued meanwhile it gets a new one | `mark_order_paid()` |
-| Browser callback and webhook both arrive, in any order, or the webhook is retried | Idempotent: the payment is recorded once; webhook event IDs are stored | `mark_order_paid()`, `payment_events` |
+| Paid more than a day late, or after the files were deleted | Not revived (it couldn't be printed); refunded automatically | `mark_order_paid()` |
+| Browser callback and webhook both arrive, in any order, or the webhook is retried | Idempotent: the payment is recorded once; the payment is always re-fetched from Razorpay rather than trusting the webhook body, and "already captured" counts as success | `settlePaymentById()`, `mark_order_paid()` |
+| Database hiccup while recording a captured payment | The webhook answers 500 so Razorpay retries; an event is only marked processed after it succeeded | `api/payments/webhook` |
 | Student closes the tab before the callback runs | Webhook confirms the payment independently | `api/payments/webhook` |
 | Two browser tabs start payment for the same order | Both use the same Razorpay order, so money can't be split across two | `checkoutFor()` |
 | A second payment for an already-paid order | Detected and refunded automatically | `settlePayment()` |
@@ -79,7 +84,8 @@ hold even if someone calls the API directly; the tests in `supabase/tests/db.tes
 | Auto-capture off in Razorpay | App captures authorised payments itself | `capturePayment()` |
 | Student cancels a paid order, or pays after cancelling | Refunded automatically | `cancel_my_order()`, `mark_order_paid()` |
 | Shop cancels a paid order (bad file, printer down) | Refunded automatically, student notified | `processRefund()` |
-| Refund API fails | Order shows "Refund pending" in a Refunds tab with the error and a *Retry refund* button; a claim flag prevents double refunds | `processRefund()` |
+| Refund API fails, or Razorpay later reports `refund.failed` | Order shows "Refund pending" in a Refunds tab with the error and a *Retry refund* button; the nightly job also retries; a claim flag (released after 10 minutes if the server crashed mid-refund) prevents double refunds | `processRefund()`, webhook, cron |
+| Refund of a duplicate/wrong-amount payment fails | Recorded and retried with the webhook; successful stray refunds are logged in `payment_events` | `refundStray()` |
 | Pay-at-shop order at the counter | *Hand over* asks staff to confirm the cash first; can't mark collected while unpaid | `PAYMENT_PENDING` |
 | Online payment not configured yet | Pay online hidden; everything works with pay-at-shop | `onlinePaymentsAvailable()` |
 
@@ -91,7 +97,8 @@ hold even if someone calls the API directly; the tests in `supabase/tests/db.tes
 | Staff hand over the wrong order by mistake | *Undo hand-over* for 15 minutes; cash payment reverts to unpaid | `staff_transition_order()` |
 | Printer jammed, needs reprint | *Reprint* moves a ready order back to printing | `ready → taken` |
 | Staff took an order but can't finish it | *Back to queue* | `taken → placed` |
-| Student never collects | *Not collected* cancels it and counts as a no-show for that student | `cancel_code = not_collected` |
+| Student never collects | *Not collected* cancels it and counts as a no-show for that student. If it was paid online the payment is kept, because the prints were made | `cancel_code = not_collected` |
+| Order left "ready" for weeks | Its files are kept until it is collected or cancelled, so staff can still reprint | `files_due_for_deletion()` |
 | Friend collects | Friend's name and number are on the order; staff search by token, name or roll number | dashboard search |
 | Someone shows another student's token | Staff see the student's name, department, roll number and phone next to the token | dashboard |
 | Tokens run past 9999 | Tokens cycle from 1000 but are never reused while an order with that token is open | `next_order_token()` |
@@ -117,9 +124,10 @@ hold even if someone calls the API directly; the tests in `supabase/tests/db.tes
 | Situation | What happens | Where |
 |---|---|---|
 | Student guesses another order's ID | Row-level security: students only ever see their own orders, items and files | RLS policies |
+| Student asks for another student's no-show count | Only the student themselves and staff get a number | `no_show_count()` |
 | Direct access to uploaded files | Bucket is private; only staff get 5-minute download links; uploads use 10-minute links | `r2.ts` |
-| "Files removed automatically a week after the order" | Nightly job deletes files once the order is 7 days old (configurable) — but never while the order is still waiting to be printed | `files_due_for_deletion()`, `api/cron/cleanup` |
-| Clean-up job stops running | Optional R2 lifecycle rule deletes anything older than 30 days | README §2.4 |
+| "Files removed automatically a week after the order" | Nightly job deletes files once the order is 7 days old (configurable) — but never while the order is still waiting to be printed or collected | `files_due_for_deletion()`, `api/cron/cleanup` |
+| Clean-up job stops running | R2 lifecycle rules delete abandoned uploads after 1 day and anything else after 30 days | README §2.4 |
 | Old order opened after its files were deleted | Order history stays; download shows "File removed" | download route |
 | Cron endpoint called by a stranger | Requires `CRON_SECRET` | `api/cron/cleanup` |
 

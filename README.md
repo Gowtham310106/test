@@ -28,14 +28,16 @@ Student phone                         Next.js (API routes)                 Supab
                 ◄── presigned PUT URL
    PUT file ─────────────────────────────────────────────────────────────► R2 (private bucket)
    POST /api/uploads/:id ──────────────► re-reads the object: real type?     files row (ready,
-                                         counts pages (pdf-lib / docx)        detected_pages)
+                                         counts pages (pdf.js + pdf-lib,      detected_pages);
+                                         must agree), re-stores the bytes     verified copy in
+                                         it counted                           R2 under files/
 2. choose B&W/colour, pages, copies — price shown instantly (same formula as the database)
 3. POST /api/orders ───────────────────► place_order() in Postgres: ownership, limits, prices,
                                          token — all in one transaction
    (online) Razorpay Checkout ────────► /api/payments/verify + webhook ──► mark_order_paid()
 4. Shop dashboard (realtime) ─────────► staff_transition_order(): take → ready → collected
                                          push notification "ready"
-5. Nightly /api/cron/cleanup ─────────► expire unpaid orders, delete files after 7 days from R2
+5. Nightly /api/cron/cleanup ─────────► expire unpaid orders, retry refunds, delete files after 7 days
 ```
 
 **Order journey:** `awaiting payment` (online only, hidden from the shop) → `placed` (in the queue, token issued) →
@@ -127,16 +129,18 @@ Realtime for the `orders` table is enabled by the migration.
    ```
 3. **R2 → Manage API tokens → Create API token** with *Object Read & Write* on that bucket. Copy the access key ID,
    secret and your account ID.
-4. Optional safety net: **Bucket → Settings → Object lifecycle rules** → delete objects with prefix `uploads/`
-   after 30 days. The app deletes files after the retention period itself (7 days by default); this only catches
-   anything missed if the clean-up job stops running.
+4. **Bucket → Settings → Object lifecycle rules** — add two rules:
+   - prefix `incoming/`, delete after **1 day**. Browsers upload here; the server re-stores each verified file under
+     `files/` and deletes the upload, so anything left in `incoming/` is an abandoned or repeated upload.
+   - prefix `files/`, delete after **30 days** — a safety net only. The app deletes files after the retention period
+     itself (7 days by default); this catches anything missed if the clean-up job stops running.
 
 ### 3. Razorpay (online payments — optional)
 
 1. Create an account and complete KYC so payments settle to the shop's bank account. Use **test mode** keys first.
 2. **Settings → API Keys**: generate a key ID and secret.
 3. **Settings → Webhooks → Add**: URL `https://<your-domain>/api/payments/webhook`, a secret of your choice, events
-   `payment.authorized`, `payment.captured`, `order.paid`, `refund.processed`.
+   `payment.authorized`, `payment.captured`, `order.paid`, `refund.processed`, `refund.failed`.
 4. **Settings → Payment capture**: automatic capture is recommended (the app also captures authorised payments itself).
 
 Without these keys the *Pay online* option is hidden and every order is pay-at-shop. The gateway fee can be absorbed

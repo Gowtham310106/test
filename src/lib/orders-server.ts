@@ -57,19 +57,34 @@ export async function checkoutFor(order: Order, profile: Profile, shopName: stri
   };
 }
 
+/** Outcomes that are final answers, not failures worth retrying. */
+const SETTLED_ERRORS = new Set(["AMOUNT_MISMATCH", "ORDER_NOT_FOUND"]);
+
 /**
  * Records a payment the gateway confirmed, capturing it first if needed.
- * Used by both the browser callback and the webhook, in any order.
+ * Used by both the browser callback and the webhook, in any order and any
+ * number of times. Always works from the payment's current state at
+ * Razorpay, never from a (possibly stale) webhook payload.
+ *
+ * Throws on unexpected failures so the webhook answers 500 and Razorpay
+ * retries: a captured payment must never be silently dropped.
  */
-export async function settlePayment(payment: RazorpayPayment): Promise<Order | null> {
+export async function settlePaymentById(paymentId: string): Promise<Order | null> {
+  let payment = await getPayment(paymentId);
   if (!payment.order_id) return null;
-  const admin = createAdminClient();
 
   if (payment.status === "authorized") {
-    payment = await capturePayment(payment.id, payment.amount);
+    try {
+      payment = await capturePayment(payment.id, payment.amount);
+    } catch (e) {
+      // Captured meanwhile (auto-capture, or the other of callback/webhook).
+      payment = await getPayment(paymentId);
+      if (payment.status !== "captured") throw e;
+    }
   }
   if (payment.status !== "captured") return null;
 
+  const admin = createAdminClient();
   const { data: order, error } = await admin
     .rpc("mark_order_paid", {
       p_razorpay_order_id: payment.order_id,
@@ -79,10 +94,9 @@ export async function settlePayment(payment: RazorpayPayment): Promise<Order | n
     .single<Order>();
 
   if (error) {
-    if (error.message === "AMOUNT_MISMATCH") {
-      await refundStray(payment, "amount did not match the order");
-    }
-    if (error.message !== "ORDER_NOT_FOUND") console.error("mark_order_paid failed", error);
+    if (!SETTLED_ERRORS.has(error.message)) throw new Error(`mark_order_paid failed: ${error.message}`);
+    if (error.message === "AMOUNT_MISMATCH") await refundStray(payment, "amount did not match the order");
+    else console.warn(`payment ${payment.id} is for an unknown order ${payment.order_id}`);
     return null;
   }
 
@@ -92,44 +106,60 @@ export async function settlePayment(payment: RazorpayPayment): Promise<Order | n
     return order;
   }
 
-  await processRefund(order);
-  if (order.status === "placed") {
-    await notifyUser(order.student_id, {
-      title: `Order ${order.token} confirmed`,
+  const final = await processRefund(order);
+  if (final.status === "placed" && final.paid_at && Date.now() - new Date(final.paid_at).getTime() < 60_000) {
+    await notifyUser(final.student_id, {
+      title: `Order ${final.token} confirmed`,
       body: "Payment received. Your order is in the shop's queue.",
-      url: `${siteUrl()}/orders/${order.id}`,
-      tag: `order-${order.id}`,
+      url: `${siteUrl()}/orders/${final.id}`,
+      tag: `order-${final.id}`,
     });
   }
-  return order;
-}
-
-export async function settlePaymentById(paymentId: string) {
-  return settlePayment(await getPayment(paymentId));
-}
-
-async function refundStray(payment: RazorpayPayment, reason: string) {
-  try {
-    await refundPayment(payment.id, payment.amount, { reason });
-  } catch (e) {
-    console.error(`refund of stray payment ${payment.id} failed`, e);
-  }
+  return final;
 }
 
 /**
+ * Refunds a payment that doesn't belong to any order (a duplicate, or a wrong
+ * amount). Failures are recorded in payment_events for follow-up and rethrown
+ * so the webhook is retried.
+ */
+async function refundStray(payment: RazorpayPayment, reason: string) {
+  const admin = createAdminClient();
+  const id = `stray-refund:${payment.id}`;
+  const { data: done } = await admin.from("payment_events").select("id").eq("id", id).maybeSingle();
+  if (done) return;
+  try {
+    await refundPayment(payment.id, payment.amount, { reason });
+    await admin.from("payment_events").insert({
+      id,
+      event_type: "stray_refund",
+      razorpay_order_id: payment.order_id,
+      payload: { payment_id: payment.id, amount: payment.amount, reason },
+    });
+  } catch (e) {
+    console.error(`refund of stray payment ${payment.id} failed`, e);
+    throw e;
+  }
+}
+
+// A claim older than this belongs to a request that crashed mid-refund.
+const STALE_REFUND_CLAIM_MS = 10 * 60_000;
+
+/**
  * Refunds an order marked refund_pending. Claims the order first so the
- * webhook and a staff action can't both refund it.
+ * webhook, the cron job and a staff action can't all refund it.
  */
 export async function processRefund(order: Order): Promise<Order> {
   if (order.payment_status !== "refund_pending" || !order.razorpay_payment_id) return order;
   const admin = createAdminClient();
 
+  const staleBefore = new Date(Date.now() - STALE_REFUND_CLAIM_MS).toISOString();
   const { data: claimed } = await admin
     .from("orders")
     .update({ refund_id: "pending", refund_error: null })
     .eq("id", order.id)
     .eq("payment_status", "refund_pending")
-    .is("refund_id", null)
+    .or(`refund_id.is.null,and(refund_id.eq.pending,updated_at.lt."${staleBefore}")`)
     .select("id")
     .maybeSingle();
   if (!claimed) return order;
@@ -139,6 +169,8 @@ export async function processRefund(order: Order): Promise<Order> {
       order_id: order.id,
       token: String(order.token),
     });
+    // "refunded" means Razorpay accepted the refund; a refund.failed webhook
+    // puts the order back to refund_pending.
     const { data } = await admin
       .from("orders")
       .update({ refund_id: refund.id, payment_status: "refunded" })
